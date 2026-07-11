@@ -147,7 +147,7 @@ A `Procfile` is included: `web: gunicorn app:app ...`. Set the same env vars.
 | `classifier.py` | AI urgency/importance scoring (Gemini, free tier) |
 | `report.py` | CSV / HTML export |
 | `config.py` | Settings from environment |
-| `templates/` | `login.html`, `dashboard.html` |
+| `templates_html.py` | The web pages (login + dashboard), inline — no folders |
 | `Dockerfile`, `Procfile`, `render.yaml` | Deployment |
 | `data/users/<user>/` | Per-user tokens + cached sorts (git-ignored) |
 
