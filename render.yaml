@@ -1,0 +1,31 @@
+# One-click-ish deploy config for Render (https://render.com).
+# In the Render dashboard: New + → Blueprint → point at this repo.
+services:
+  - type: web
+    name: email-sorter
+    runtime: python
+    plan: starter            # smallest paid plan; free tier also works but sleeps
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+    healthCheckPath: /healthz
+    disk:
+      name: data
+      mountPath: /data       # persists user tokens across deploys/restarts
+      sizeGB: 1
+    envVars:
+      - key: DATA_DIR
+        value: /data
+      - key: BASE_URL
+        sync: false          # set to your https URL after first deploy
+      - key: GEMINI_API_KEY
+        sync: false          # paste your free Gemini key in the dashboard (kept secret)
+      - key: GEMINI_MODEL
+        value: gemini-2.0-flash
+      - key: FLASK_SECRET_KEY
+        generateValue: true  # Render generates a strong random value
+      - key: MAX_EMAILS
+        value: "40"
+      # CLIENT_SECRET_FILE: upload credentials.json as a Secret File in the
+      # dashboard, then set this to its mounted path (e.g. /etc/secrets/credentials.json)
+      - key: CLIENT_SECRET_FILE
+        sync: false
