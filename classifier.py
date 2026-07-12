@@ -1,18 +1,14 @@
-"""Email classification: AI-first with an automatic no-cost fallback.
+"""AI-based email classification using Google Gemini's free API tier.
 
-Primary: Google Gemini (free tier) classifies emails in BATCHES (many emails
-per request) to stay within rate limits.
+Each email is scored for urgency (time pressure) and importance (consequence),
+then placed into one of four Eisenhower-matrix buckets.
 
-Fallback: if Gemini is unavailable for ANY reason (no key, quota/429, region
-block, network error), we transparently fall back to a rules-based scorer so
-the inbox still gets sorted. Rules use urgency keywords, sender type, and
-conversation signals. When the free AI becomes available, the app uses it
-again automatically with no changes.
+We call Gemini's REST endpoint directly with the standard library, so there is
+no extra SDK dependency to install or keep up to date.
 """
 from __future__ import annotations
 
 import json
-import time
 import urllib.error
 import urllib.request
 from typing import TYPE_CHECKING
@@ -27,21 +23,17 @@ ENDPOINT = (
     "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
 )
 
-BATCH_SIZE = 15
-DELAY_BETWEEN_BATCHES = 3
-MAX_RETRIES = 2
-BODY_CHARS = 700
-
 SYSTEM_PROMPT = """You are an expert executive assistant who triages email.
 
-You will receive several emails, each marked with an [id]. For EACH email, judge:
-- URGENCY (1-5): how time-sensitive it is. 5 = needs action within hours; \
-1 = no time pressure.
-- IMPORTANCE (1-5): how consequential it is to the recipient's goals, money, \
-relationships, or obligations. 5 = major; 1 = trivial/noise (newsletters, \
-promos, automated notifications).
+For each email, judge two things independently on a 1-5 scale:
+- URGENCY: how time-sensitive it is. 5 = needs action within hours; \
+1 = no time pressure at all.
+- IMPORTANCE: how consequential it is to the recipient's goals, \
+relationships, money, or obligations. 5 = major consequences; \
+1 = trivial/noise (newsletters, promos, automated notifications).
 
-Assign a category (>=4 counts as high):
+Then assign a category using these thresholds (urgency/importance >= 4 counts \
+as high):
 - "urgent_important": high urgency AND high importance
 - "important": high importance, low urgency
 - "urgent": high urgency, low importance
@@ -50,191 +42,72 @@ Assign a category (>=4 counts as high):
 Marketing, promotions, newsletters, and automated no-reply notifications are \
 almost always "neither" unless they contain a real personal deadline.
 
-Respond with ONLY a JSON array, one object per email, no prose:
-[{"id": <the id>, "urgency": <1-5>, "importance": <1-5>, \
-"category": "<one of the four>", "reason": "<one short sentence>"}]"""
-
-
-URGENT_STRONG = [
-    "urgent", "asap", "as soon as possible", "immediately", "action required",
-    "action needed", "response required", "time sensitive", "time-sensitive",
-    "final notice", "last chance", "overdue", "expires today", "due today",
-    "respond today", "eod", "deadline", "past due", "act now", "expiring soon",
-]
-URGENT_SOFT = [
-    "today", "tomorrow", "reminder", "due", "expires", "expiring", "reply by",
-    "respond by", "please respond", "please reply", "confirm", "closing",
-    "ends soon", "limited time", "waiting", "follow up", "follow-up",
-]
-IMPORTANT_TERMS = [
-    "invoice", "payment", "past due", "contract", "agreement", "legal", "tax",
-    "security alert", "suspicious", "password", "verify your", "verification",
-    "suspended", "account", "interview", "job offer", "offer", "meeting",
-    "calendar", "refund", "bank", "wire", "transfer", "important", "approval",
-    "approve", "sign", "signature", "renewal", "delivery", "shipment", "order",
-    "receipt", "statement", "appointment", "deadline",
-]
-BULK_SENDER = [
-    "no-reply", "noreply", "no_reply", "donotreply", "do-not-reply",
-    "newsletter", "marketing", "notifications", "notification", "mailer",
-    "updates", "promo", "promotions", "deals", "news@", "campaign",
-]
-BULK_BODY = [
-    "unsubscribe", "view in browser", "% off", "shop now", "coupon",
-    "promo code", "newsletter", "limited time offer", "manage preferences",
-    "you are receiving this", "update your preferences",
-]
-
-
-def _hits(text, terms):
-    return [t for t in terms if t in text]
-
-
-class GeminiError(Exception):
-    def __init__(self, status, detail):
-        self.status = status
-        self.detail = detail
-        super().__init__(f"{status}: {detail}")
+Respond with ONLY a JSON object, no prose, in exactly this shape:
+{"urgency": <1-5>, "importance": <1-5>, "category": "<one of the four>", \
+"reason": "<one short sentence>"}"""
 
 
 class Classifier:
-    def __init__(self, api_key=None, model=None):
-        self.api_key = api_key if api_key is not None else config.GEMINI_API_KEY
+    def __init__(self, api_key: str | None = None, model: str | None = None):
+        self.api_key = api_key or config.GEMINI_API_KEY
+        if not self.api_key:
+            raise RuntimeError(
+                "GEMINI_API_KEY is not set. Get a free key at "
+                "https://aistudio.google.com/apikey and set it in your environment."
+            )
         self.model = model or config.GEMINI_MODEL
 
-    def _call_gemini(self, user_content):
-        if not self.api_key:
-            raise GeminiError("no-key", "No API key configured.")
+    def _call_gemini(self, user_content: str) -> str:
         url = ENDPOINT.format(model=self.model, key=self.api_key)
         body = {
             "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
             "contents": [{"role": "user", "parts": [{"text": user_content}]}],
             "generationConfig": {
-                "maxOutputTokens": 4096,
+                "maxOutputTokens": 300,
                 "temperature": 0,
                 "responseMimeType": "application/json",
             },
         }
-        data = json.dumps(body).encode("utf-8")
-        last_err = None
-        for attempt in range(MAX_RETRIES):
-            req = urllib.request.Request(
-                url, data=data,
-                headers={"Content-Type": "application/json"}, method="POST",
-            )
-            try:
-                with urllib.request.urlopen(req, timeout=60) as resp:
-                    payload = json.loads(resp.read().decode("utf-8"))
-                return payload["candidates"][0]["content"]["parts"][0]["text"]
-            except urllib.error.HTTPError as e:
-                try:
-                    detail = json.loads(e.read().decode("utf-8", "replace"))["error"]["message"]
-                except Exception:
-                    detail = "HTTP error"
-                last_err = GeminiError(e.code, detail)
-                if e.code in (429, 500, 503) and attempt < MAX_RETRIES - 1:
-                    time.sleep(2 * (attempt + 1))
-                    continue
-                raise last_err
-            except urllib.error.URLError as e:
-                last_err = GeminiError("network", str(e.reason))
-                if attempt < MAX_RETRIES - 1:
-                    time.sleep(2 * (attempt + 1))
-                    continue
-                raise last_err
-        raise last_err or GeminiError("unknown", "no response")
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return data["candidates"][0]["content"]["parts"][0]["text"]
 
-    def _classify_batch(self, batch):
-        parts = []
-        for idx, e in enumerate(batch):
-            body = (e.body or e.snippet or "")[:BODY_CHARS]
-            parts.append(
-                f"[{idx}]\nFrom: {e.sender} <{e.sender_email}>\n"
-                f"Subject: {e.subject}\nDate: {e.date}\nBody: {body}"
-            )
-        user_content = "\n\n---\n\n".join(parts)
-
+    def classify(self, email: "Email") -> "Email":
+        user_content = (
+            f"From: {email.sender} <{email.sender_email}>\n"
+            f"Subject: {email.subject}\n"
+            f"Date: {email.date}\n\n"
+            f"Body:\n{email.body or email.snippet}"
+        )
         try:
             raw = self._call_gemini(user_content)
-            results = {int(r["id"]): r for r in self._parse_array(raw)}
-        except Exception:
-            for e in batch:
-                self._rules_classify(e)
-            return
-
-        for idx, e in enumerate(batch):
-            r = results.get(idx)
-            if not r:
-                self._rules_classify(e)
-                continue
-            try:
-                e.urgency = int(r.get("urgency", 1))
-                e.importance = int(r.get("importance", 1))
-                e.category = r.get("category", "neither")
-                e.reason = r.get("reason", "")
-                if e.category not in config.CATEGORIES:
-                    e.category = self._derive_category(e.urgency, e.importance)
-            except Exception:
-                self._rules_classify(e)
-
-    def classify(self, email):
-        self._classify_batch([email])
+            parsed = self._parse_json(raw)
+            email.urgency = int(parsed.get("urgency", 1))
+            email.importance = int(parsed.get("importance", 1))
+            email.category = parsed.get("category", "neither")
+            email.reason = parsed.get("reason", "")
+            if email.category not in config.CATEGORIES:
+                email.category = self._derive_category(email.urgency, email.importance)
+        except Exception as exc:  # noqa: BLE001 - keep the run alive on one bad email
+            email.category = "neither"
+            email.urgency = email.urgency or 1
+            email.importance = email.importance or 1
+            email.reason = f"Could not classify ({exc.__class__.__name__})."
         return email
 
-    def classify_all(self, emails):
-        for start in range(0, len(emails), BATCH_SIZE):
-            batch = emails[start : start + BATCH_SIZE]
-            self._classify_batch(batch)
-            if start + BATCH_SIZE < len(emails):
-                time.sleep(DELAY_BETWEEN_BATCHES)
+    def classify_all(self, emails: list["Email"]) -> list["Email"]:
+        for e in emails:
+            self.classify(e)
         return emails
 
-    def _rules_classify(self, e):
-        subject = (e.subject or "").lower()
-        body = (e.body or e.snippet or "").lower()
-        sender = f"{e.sender} {e.sender_email}".lower()
-        reasons = []
-
-        is_bulk = bool(_hits(sender, BULK_SENDER) + _hits(body, BULK_BODY))
-
-        urgency = 1
-        if _hits(subject, URGENT_STRONG):
-            urgency += 3
-            reasons.append("urgent wording in subject")
-        elif _hits(body, URGENT_STRONG):
-            urgency += 2
-            reasons.append("urgent wording")
-        if _hits(subject, URGENT_SOFT):
-            urgency += 1
-        if subject.startswith(("re:", "fwd:", "fw:")):
-            urgency += 1
-        if is_bulk:
-            urgency -= 1
-        urgency = max(1, min(5, urgency))
-
-        importance = 2
-        if _hits(subject, IMPORTANT_TERMS):
-            importance += 2
-            reasons.append("important topic")
-        elif _hits(body, IMPORTANT_TERMS):
-            importance += 1
-        if subject.startswith(("re:", "fwd:", "fw:")):
-            importance += 1
-        if not is_bulk and " " in (e.sender or "").strip():
-            importance += 1
-        if is_bulk:
-            importance -= 2
-            reasons.append("looks like a bulk/promotional message")
-        importance = max(1, min(5, importance))
-
-        e.urgency = urgency
-        e.importance = importance
-        e.category = self._derive_category(urgency, importance)
-        note = "; ".join(reasons) if reasons else "no strong signals"
-        e.reason = f"{note} (quick sort)"
-
     @staticmethod
-    def _derive_category(urgency, importance):
+    def _derive_category(urgency: int, importance: int) -> str:
         u, i = urgency >= 4, importance >= 4
         if u and i:
             return "urgent_important"
@@ -245,10 +118,9 @@ class Classifier:
         return "neither"
 
     @staticmethod
-    def _parse_array(raw):
-        start = raw.find("[")
-        end = raw.rfind("]")
+    def _parse_json(raw: str) -> dict:
+        start = raw.find("{")
+        end = raw.rfind("}")
         if start != -1 and end != -1:
             raw = raw[start : end + 1]
-        data = json.loads(raw)
-        return data if isinstance(data, list) else []
+        return json.loads(raw)
