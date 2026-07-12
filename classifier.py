@@ -4,11 +4,14 @@ Each email is scored for urgency (time pressure) and importance (consequence),
 then placed into one of four Eisenhower-matrix buckets.
 
 We call Gemini's REST endpoint directly with the standard library, so there is
-no extra SDK dependency to install or keep up to date.
+no extra SDK dependency to install or keep up to date. The free tier is rate
+limited, so we space calls out and retry on 429/503 with backoff, and we
+surface the real HTTP error text when something goes wrong.
 """
 from __future__ import annotations
 
 import json
+import time
 import urllib.error
 import urllib.request
 from typing import TYPE_CHECKING
@@ -22,6 +25,12 @@ if TYPE_CHECKING:
 ENDPOINT = (
     "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
 )
+
+# Free-tier friendliness: the free Gemini tier allows only ~15 requests/min,
+# so we wait ~4.5s between emails (about 13/min) to stay under the limit, and
+# retry with backoff if we still get throttled.
+DELAY_BETWEEN_CALLS = 4.5   # seconds
+MAX_RETRIES = 4
 
 SYSTEM_PROMPT = """You are an expert executive assistant who triages email.
 
@@ -47,6 +56,15 @@ Respond with ONLY a JSON object, no prose, in exactly this shape:
 "reason": "<one short sentence>"}"""
 
 
+class GeminiError(Exception):
+    """Carries the HTTP status and message from a failed Gemini call."""
+
+    def __init__(self, status: int | str, detail: str):
+        self.status = status
+        self.detail = detail
+        super().__init__(f"{status}: {detail}")
+
+
 class Classifier:
     def __init__(self, api_key: str | None = None, model: str | None = None):
         self.api_key = api_key or config.GEMINI_API_KEY
@@ -68,15 +86,41 @@ class Classifier:
                 "responseMimeType": "application/json",
             },
         }
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(body).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        return data["candidates"][0]["content"]["parts"][0]["text"]
+        data = json.dumps(body).encode("utf-8")
+
+        last_err: GeminiError | None = None
+        for attempt in range(MAX_RETRIES):
+            req = urllib.request.Request(
+                url, data=data,
+                headers={"Content-Type": "application/json"}, method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+                return payload["candidates"][0]["content"]["parts"][0]["text"]
+            except urllib.error.HTTPError as e:
+                try:
+                    detail = e.read().decode("utf-8", errors="replace")
+                except Exception:  # noqa: BLE001
+                    detail = ""
+                try:
+                    detail = json.loads(detail)["error"]["message"]
+                except Exception:  # noqa: BLE001
+                    detail = detail[:200]
+                last_err = GeminiError(e.code, detail)
+                if e.code in (429, 500, 503) and attempt < MAX_RETRIES - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                raise last_err
+            except urllib.error.URLError as e:
+                last_err = GeminiError("network", str(e.reason))
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                raise last_err
+        if last_err:
+            raise last_err
+        raise GeminiError("unknown", "no response")
 
     def classify(self, email: "Email") -> "Email":
         user_content = (
@@ -94,7 +138,12 @@ class Classifier:
             email.reason = parsed.get("reason", "")
             if email.category not in config.CATEGORIES:
                 email.category = self._derive_category(email.urgency, email.importance)
-        except Exception as exc:  # noqa: BLE001 - keep the run alive on one bad email
+        except GeminiError as ge:
+            email.category = "neither"
+            email.urgency = email.urgency or 1
+            email.importance = email.importance or 1
+            email.reason = f"AI error {ge.status}: {ge.detail}"[:300]
+        except Exception as exc:  # noqa: BLE001
             email.category = "neither"
             email.urgency = email.urgency or 1
             email.importance = email.importance or 1
@@ -102,8 +151,10 @@ class Classifier:
         return email
 
     def classify_all(self, emails: list["Email"]) -> list["Email"]:
-        for e in emails:
+        for i, e in enumerate(emails):
             self.classify(e)
+            if i < len(emails) - 1:
+                time.sleep(DELAY_BETWEEN_CALLS)
         return emails
 
     @staticmethod
