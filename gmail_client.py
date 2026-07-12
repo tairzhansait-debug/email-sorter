@@ -1,20 +1,19 @@
 """Gmail access layer for the multi-user web app.
 
-Data model on disk (all git-ignored):
-
-    data/users/<user_id>/
-        account_<email>.json   # OAuth token for one connected Gmail account
-        lastsort_<email>.json  # cached results of the most recent sort
-
-`user_id` is the email of the Google account the person signed in with, so the
-same person coming back (or from another device) sees their own accounts again.
-Each user only ever touches files inside their own folder — users are isolated.
+Storage backend:
+- If UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN are set, per-user OAuth
+  tokens and last-sort results are stored in Upstash Redis (over plain HTTPS,
+  no extra library). This persists across restarts.
+- Otherwise it falls back to local files under data/ (fine for local dev).
 """
 from __future__ import annotations
 
 import base64
 import json
+import os
 import re
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from email.utils import parseaddr
 from pathlib import Path
@@ -27,8 +26,6 @@ from googleapiclient.discovery import build
 
 import config
 
-
-# --- Data class -------------------------------------------------------------
 
 @dataclass
 class Email:
@@ -52,6 +49,7 @@ class Email:
             "snippet": self.snippet, "date": self.date, "category": self.category,
             "urgency": self.urgency, "importance": self.importance,
             "reason": self.reason,
+            "body": (self.body or "")[:2500],
         }
 
     @classmethod
@@ -61,7 +59,25 @@ class Email:
             "date", "body", "category", "urgency", "importance", "reason") if k in d})
 
 
-# --- Filesystem helpers -----------------------------------------------------
+_UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL", "").rstrip("/")
+_UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
+
+
+def _redis_on() -> bool:
+    return bool(_UPSTASH_URL and _UPSTASH_TOKEN)
+
+
+def _redis(*cmd) -> object:
+    body = json.dumps([str(c) for c in cmd]).encode("utf-8")
+    req = urllib.request.Request(
+        _UPSTASH_URL, data=body,
+        headers={"Authorization": f"Bearer {_UPSTASH_TOKEN}",
+                 "Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read().decode("utf-8")).get("result")
+
 
 _SAFE = re.compile(r"[^A-Za-z0-9._@-]")
 
@@ -85,35 +101,62 @@ def _lastsort_path(user_id: str, email: str) -> Path:
 
 
 def list_accounts(user_id: str) -> list[str]:
+    if _redis_on():
+        res = _redis("SMEMBERS", f"accts:{user_id}") or []
+        return sorted(res)
     out = []
     for f in _user_dir(user_id).glob("account_*.json"):
         out.append(f.stem[len("account_"):])
     return sorted(out)
 
 
+def list_all_users() -> list[str]:
+    if _redis_on():
+        return sorted(_redis("SMEMBERS", "users") or [])
+    if not config.USERS_DIR.exists():
+        return []
+    return sorted(p.name for p in config.USERS_DIR.iterdir() if p.is_dir())
+
+
 def save_token(user_id: str, email: str, creds: Credentials) -> None:
+    if _redis_on():
+        _redis("SET", f"tok:{user_id}|{email}", creds.to_json())
+        _redis("SADD", f"accts:{user_id}", email)
+        _redis("SADD", "users", user_id)
+        return
     _account_path(user_id, email).write_text(creds.to_json())
 
 
 def remove_account(user_id: str, email: str) -> None:
+    if _redis_on():
+        _redis("DEL", f"tok:{user_id}|{email}")
+        _redis("DEL", f"ls:{user_id}|{email}")
+        _redis("SREM", f"accts:{user_id}", email)
+        if not (_redis("SMEMBERS", f"accts:{user_id}") or []):
+            _redis("SREM", "users", user_id)
+        return
     for p in (_account_path(user_id, email), _lastsort_path(user_id, email)):
         if p.exists():
             p.unlink()
 
 
 def save_last_sort(user_id: str, email: str, emails: list[Email]) -> None:
-    data = [e.to_dict() for e in emails]
-    _lastsort_path(user_id, email).write_text(json.dumps(data))
+    data = json.dumps([e.to_dict() for e in emails])
+    if _redis_on():
+        _redis("SET", f"ls:{user_id}|{email}", data)
+        return
+    _lastsort_path(user_id, email).write_text(data)
 
 
 def load_last_sort(user_id: str, email: str) -> list[dict]:
+    if _redis_on():
+        raw = _redis("GET", f"ls:{user_id}|{email}")
+        return json.loads(raw) if raw else []
     p = _lastsort_path(user_id, email)
     if p.exists():
         return json.loads(p.read_text())
     return []
 
-
-# --- OAuth (web redirect flow) ---------------------------------------------
 
 def _flow(state: str | None = None) -> Flow:
     return Flow.from_client_secrets_file(
@@ -125,7 +168,6 @@ def _flow(state: str | None = None) -> Flow:
 
 
 def build_auth_url() -> tuple[str, str]:
-    """Return (authorization_url, state) to redirect the user to Google."""
     if not config.CLIENT_SECRET_FILE.exists():
         raise FileNotFoundError(
             "credentials.json (Web application OAuth client) not found. "
@@ -133,15 +175,12 @@ def build_auth_url() -> tuple[str, str]:
         )
     flow = _flow()
     auth_url, state = flow.authorization_url(
-        access_type="offline",
-        include_granted_scopes="true",
-        prompt="consent",
+        access_type="offline", include_granted_scopes="true", prompt="consent",
     )
     return auth_url, state
 
 
 def exchange_code(authorization_response_url: str, state: str) -> tuple[str, Credentials]:
-    """Complete the OAuth callback. Returns (email, credentials)."""
     flow = _flow(state=state)
     flow.fetch_token(authorization_response=authorization_response_url)
     creds = flow.credentials
@@ -151,6 +190,19 @@ def exchange_code(authorization_response_url: str, state: str) -> tuple[str, Cre
 
 
 def _load_credentials(user_id: str, email: str) -> Credentials:
+    if _redis_on():
+        raw = _redis("GET", f"tok:{user_id}|{email}")
+        if not raw:
+            raise FileNotFoundError(f"No connected account {email} for this user.")
+        creds = Credentials.from_authorized_user_info(json.loads(raw), config.GMAIL_SCOPES)
+        if not creds.valid:
+            if creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+                _redis("SET", f"tok:{user_id}|{email}", creds.to_json())
+            else:
+                raise RuntimeError(f"Access for {email} expired. Reconnect the account.")
+        return creds
+
     path = _account_path(user_id, email)
     if not path.exists():
         raise FileNotFoundError(f"No connected account {email} for this user.")
@@ -163,8 +215,6 @@ def _load_credentials(user_id: str, email: str) -> Credentials:
             raise RuntimeError(f"Access for {email} expired. Reconnect the account.")
     return creds
 
-
-# --- The per-account client -------------------------------------------------
 
 class GmailClient:
     def __init__(self, user_id: str, email: str):
