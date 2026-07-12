@@ -211,3 +211,47 @@ def export(fmt):
     cached = gmail_client.load_last_sort(user_id, account) if account else []
     if not cached:
         flash("Nothing to export — run a sort first.", "error")
+        return redirect(url_for("dashboard"))
+    objs = [Email.from_dict(d) for d in cached]
+    path = report.export_csv(objs, account) if fmt == "csv" else report.export_html(objs, account)
+    return send_file(path, as_attachment=True)
+
+
+@app.route("/healthz")
+def healthz():
+    return {"status": "ok"}
+
+
+def _run_all_sorts():
+    clf = Classifier()
+    summary = {"users": 0, "accounts": 0, "emails": 0, "labeled": 0, "errors": []}
+    if not config.USERS_DIR.exists():
+        return summary
+    for udir in sorted(p for p in config.USERS_DIR.iterdir() if p.is_dir()):
+        user_id = udir.name
+        summary["users"] += 1
+        for account in gmail_client.list_accounts(user_id):
+            try:
+                client = gmail_client.GmailClient(user_id, account)
+                emails = client.fetch_inbox()
+                clf.classify_all(emails)
+                gmail_client.save_last_sort(user_id, account, emails)
+                n = client.apply_labels_bulk(emails)
+                summary["accounts"] += 1
+                summary["emails"] += len(emails)
+                summary["labeled"] += n
+            except Exception as exc:
+                summary["errors"].append(f"{account}: {exc.__class__.__name__}")
+    return summary
+
+
+@app.route("/cron/run")
+def cron_run():
+    secret = os.environ.get("CRON_SECRET", "")
+    if not secret or request.args.get("token") != secret:
+        abort(403)
+    return _run_all_sorts()
+
+
+if __name__ == "__main__":
+    app.run(host=config.FLASK_HOST, port=config.FLASK_PORT, debug=False)
