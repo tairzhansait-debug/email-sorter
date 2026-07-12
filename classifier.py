@@ -132,4 +132,123 @@ class Classifier:
                 except Exception:
                     detail = "HTTP error"
                 last_err = GeminiError(e.code, detail)
-                if e.code in (429, 500, 503) and attempt <
+                if e.code in (429, 500, 503) and attempt < MAX_RETRIES - 1:
+                    time.sleep(2 * (attempt + 1))
+                    continue
+                raise last_err
+            except urllib.error.URLError as e:
+                last_err = GeminiError("network", str(e.reason))
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(2 * (attempt + 1))
+                    continue
+                raise last_err
+        raise last_err or GeminiError("unknown", "no response")
+
+    def _classify_batch(self, batch):
+        parts = []
+        for idx, e in enumerate(batch):
+            body = (e.body or e.snippet or "")[:BODY_CHARS]
+            parts.append(
+                f"[{idx}]\nFrom: {e.sender} <{e.sender_email}>\n"
+                f"Subject: {e.subject}\nDate: {e.date}\nBody: {body}"
+            )
+        user_content = "\n\n---\n\n".join(parts)
+
+        try:
+            raw = self._call_gemini(user_content)
+            results = {int(r["id"]): r for r in self._parse_array(raw)}
+        except Exception:
+            for e in batch:
+                self._rules_classify(e)
+            return
+
+        for idx, e in enumerate(batch):
+            r = results.get(idx)
+            if not r:
+                self._rules_classify(e)
+                continue
+            try:
+                e.urgency = int(r.get("urgency", 1))
+                e.importance = int(r.get("importance", 1))
+                e.category = r.get("category", "neither")
+                e.reason = r.get("reason", "")
+                if e.category not in config.CATEGORIES:
+                    e.category = self._derive_category(e.urgency, e.importance)
+            except Exception:
+                self._rules_classify(e)
+
+    def classify(self, email):
+        self._classify_batch([email])
+        return email
+
+    def classify_all(self, emails):
+        for start in range(0, len(emails), BATCH_SIZE):
+            batch = emails[start : start + BATCH_SIZE]
+            self._classify_batch(batch)
+            if start + BATCH_SIZE < len(emails):
+                time.sleep(DELAY_BETWEEN_BATCHES)
+        return emails
+
+    def _rules_classify(self, e):
+        subject = (e.subject or "").lower()
+        body = (e.body or e.snippet or "").lower()
+        sender = f"{e.sender} {e.sender_email}".lower()
+        reasons = []
+
+        is_bulk = bool(_hits(sender, BULK_SENDER) + _hits(body, BULK_BODY))
+
+        urgency = 1
+        if _hits(subject, URGENT_STRONG):
+            urgency += 3
+            reasons.append("urgent wording in subject")
+        elif _hits(body, URGENT_STRONG):
+            urgency += 2
+            reasons.append("urgent wording")
+        if _hits(subject, URGENT_SOFT):
+            urgency += 1
+        if subject.startswith(("re:", "fwd:", "fw:")):
+            urgency += 1
+        if is_bulk:
+            urgency -= 1
+        urgency = max(1, min(5, urgency))
+
+        importance = 2
+        if _hits(subject, IMPORTANT_TERMS):
+            importance += 2
+            reasons.append("important topic")
+        elif _hits(body, IMPORTANT_TERMS):
+            importance += 1
+        if subject.startswith(("re:", "fwd:", "fw:")):
+            importance += 1
+        if not is_bulk and " " in (e.sender or "").strip():
+            importance += 1
+        if is_bulk:
+            importance -= 2
+            reasons.append("looks like a bulk/promotional message")
+        importance = max(1, min(5, importance))
+
+        e.urgency = urgency
+        e.importance = importance
+        e.category = self._derive_category(urgency, importance)
+        note = "; ".join(reasons) if reasons else "no strong signals"
+        e.reason = f"{note} (quick sort)"
+
+    @staticmethod
+    def _derive_category(urgency, importance):
+        u, i = urgency >= 4, importance >= 4
+        if u and i:
+            return "urgent_important"
+        if i:
+            return "important"
+        if u:
+            return "urgent"
+        return "neither"
+
+    @staticmethod
+    def _parse_array(raw):
+        start = raw.find("[")
+        end = raw.rfind("]")
+        if start != -1 and end != -1:
+            raw = raw[start : end + 1]
+        data = json.loads(raw)
+        return data if isinstance(data, list) else []
