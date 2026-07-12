@@ -10,6 +10,7 @@ Production:  gunicorn app:app   (see README)
 from __future__ import annotations
 
 import functools
+import os
 
 from flask import (
     Flask, abort, flash, redirect, render_template_string, request, send_file,
@@ -26,7 +27,6 @@ from templates_html import DASHBOARD_HTML, LOGIN_HTML
 
 app = Flask(__name__)
 app.secret_key = config.FLASK_SECRET_KEY
-# Trust the X-Forwarded-* headers set by hosting proxies (Render, Railway, etc.)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
@@ -35,9 +35,7 @@ app.config.update(
 )
 
 
-# --- Auth helpers -----------------------------------------------------------
-
-def current_user() -> str | None:
+def current_user():
     return session.get("user_id")
 
 
@@ -50,7 +48,7 @@ def login_required(view):
     return wrapped
 
 
-def _selected_account(user_id: str) -> str | None:
+def _selected_account(user_id):
     accts = gmail_client.list_accounts(user_id)
     sel = session.get("account")
     if sel in accts:
@@ -60,8 +58,6 @@ def _selected_account(user_id: str) -> str | None:
         return accts[0]
     return None
 
-
-# --- Public pages -----------------------------------------------------------
 
 @app.route("/")
 def index():
@@ -84,16 +80,12 @@ def logout():
     return redirect(url_for("login"))
 
 
-# --- OAuth ------------------------------------------------------------------
-
 @app.route("/authorize")
 def authorize():
-    """Start Google sign-in (also used to connect an additional inbox)."""
-    # mode: "login" for first sign-in, "add" to attach another inbox
     session["oauth_mode"] = "add" if current_user() else "login"
     try:
         auth_url, state = gmail_client.build_auth_url()
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         flash(f"Sign-in is not configured: {exc}", "error")
         return redirect(url_for("login"))
     session["oauth_state"] = state
@@ -109,25 +101,21 @@ def oauth2callback():
     mode = session.pop("oauth_mode", "login")
     if not state:
         abort(400, "Missing OAuth state.")
-    # Rebuild the callback URL using our known BASE_URL so the scheme matches
-    # the registered redirect URI even behind an HTTPS-terminating proxy.
     authorization_response = config.BASE_URL + request.full_path
     try:
         email, creds = gmail_client.exchange_code(authorization_response, state)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         flash(f"Could not complete sign-in: {exc}", "error")
         return redirect(url_for("login"))
 
     if mode == "login" or not current_user():
-        session["user_id"] = email  # identity = the account you signed in with
+        session["user_id"] = email
     user_id = session["user_id"]
     gmail_client.save_token(user_id, email, creds)
     session["account"] = email
     flash(f"Connected {email}.", "success")
     return redirect(url_for("dashboard"))
 
-
-# --- Dashboard --------------------------------------------------------------
 
 @app.route("/dashboard")
 @login_required
@@ -174,7 +162,6 @@ def remove_account():
         if session.get("account") == account:
             session.pop("account", None)
         flash(f"Disconnected {account}.", "info")
-    # If they removed their last account, keep them signed in but empty.
     return redirect(url_for("dashboard"))
 
 
@@ -193,7 +180,7 @@ def sort_emails():
         classifier.classify_all(emails)
         gmail_client.save_last_sort(user_id, account, emails)
         flash(f"Sorted {len(emails)} emails from {account}.", "success")
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         flash(f"Sorting failed: {exc}", "error")
     return redirect(url_for("dashboard"))
 
@@ -211,31 +198,16 @@ def apply_labels():
         client = gmail_client.GmailClient(user_id, account)
         n = client.apply_labels_bulk([Email.from_dict(d) for d in cached])
         flash(f"Applied labels to {n} emails in Gmail.", "success")
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         flash(f"Applying labels failed: {exc}", "error")
     return redirect(url_for("dashboard"))
 
 
 @app.route("/export/<fmt>")
 @login_required
-def export(fmt: str):
+def export(fmt):
     user_id = current_user()
     account = _selected_account(user_id)
     cached = gmail_client.load_last_sort(user_id, account) if account else []
     if not cached:
         flash("Nothing to export — run a sort first.", "error")
-        return redirect(url_for("dashboard"))
-    objs = [Email.from_dict(d) for d in cached]
-    path = report.export_csv(objs, account) if fmt == "csv" else report.export_html(objs, account)
-    return send_file(path, as_attachment=True)
-
-
-@app.route("/healthz")
-def healthz():
-    return {"status": "ok"}
-
-
-if __name__ == "__main__":
-    print(f"\n  Email Sorter on http://{config.FLASK_HOST}:{config.FLASK_PORT}")
-    print(f"  Public BASE_URL = {config.BASE_URL}\n")
-    app.run(host=config.FLASK_HOST, port=config.FLASK_PORT, debug=False)
