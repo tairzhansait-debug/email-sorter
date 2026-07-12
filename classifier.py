@@ -1,13 +1,13 @@
-"""AI-based email classification using Google Gemini's free API tier.
+"""Email classification: AI-first with an automatic no-cost fallback.
 
-To stay well within the free tier's rate/quota limits, we classify emails in
-BATCHES: many emails are sent in a single request and Gemini returns a JSON
-array with one verdict per email. That turns an N-email sort into just a
-handful of API calls (usually one), instead of N calls.
+Primary: Google Gemini (free tier) classifies emails in BATCHES (many emails
+per request) to stay within rate limits.
 
-We call Gemini's REST endpoint directly with the standard library (no SDK
-dependency), retry on 429/503 with backoff, and surface the real HTTP error
-text when something goes wrong.
+Fallback: if Gemini is unavailable for ANY reason (no key, quota/429, region
+block, network error), we transparently fall back to a rules-based scorer so
+the inbox still gets sorted. Rules use urgency keywords, sender type, and
+conversation signals. When the free AI becomes available, the app uses it
+again automatically with no changes.
 """
 from __future__ import annotations
 
@@ -27,10 +27,10 @@ ENDPOINT = (
     "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
 )
 
-BATCH_SIZE = 15            # emails per single API call
-DELAY_BETWEEN_BATCHES = 3  # seconds, only matters if there are multiple batches
-MAX_RETRIES = 3
-BODY_CHARS = 700           # how much of each email body to send
+BATCH_SIZE = 15
+DELAY_BETWEEN_BATCHES = 3
+MAX_RETRIES = 2
+BODY_CHARS = 700
 
 SYSTEM_PROMPT = """You are an expert executive assistant who triages email.
 
@@ -55,26 +55,56 @@ Respond with ONLY a JSON array, one object per email, no prose:
 "category": "<one of the four>", "reason": "<one short sentence>"}]"""
 
 
-class GeminiError(Exception):
-    """Carries the HTTP status and message from a failed Gemini call."""
+URGENT_STRONG = [
+    "urgent", "asap", "as soon as possible", "immediately", "action required",
+    "action needed", "response required", "time sensitive", "time-sensitive",
+    "final notice", "last chance", "overdue", "expires today", "due today",
+    "respond today", "eod", "deadline", "past due", "act now", "expiring soon",
+]
+URGENT_SOFT = [
+    "today", "tomorrow", "reminder", "due", "expires", "expiring", "reply by",
+    "respond by", "please respond", "please reply", "confirm", "closing",
+    "ends soon", "limited time", "waiting", "follow up", "follow-up",
+]
+IMPORTANT_TERMS = [
+    "invoice", "payment", "past due", "contract", "agreement", "legal", "tax",
+    "security alert", "suspicious", "password", "verify your", "verification",
+    "suspended", "account", "interview", "job offer", "offer", "meeting",
+    "calendar", "refund", "bank", "wire", "transfer", "important", "approval",
+    "approve", "sign", "signature", "renewal", "delivery", "shipment", "order",
+    "receipt", "statement", "appointment", "deadline",
+]
+BULK_SENDER = [
+    "no-reply", "noreply", "no_reply", "donotreply", "do-not-reply",
+    "newsletter", "marketing", "notifications", "notification", "mailer",
+    "updates", "promo", "promotions", "deals", "news@", "campaign",
+]
+BULK_BODY = [
+    "unsubscribe", "view in browser", "% off", "shop now", "coupon",
+    "promo code", "newsletter", "limited time offer", "manage preferences",
+    "you are receiving this", "update your preferences",
+]
 
-    def __init__(self, status: int | str, detail: str):
+
+def _hits(text, terms):
+    return [t for t in terms if t in text]
+
+
+class GeminiError(Exception):
+    def __init__(self, status, detail):
         self.status = status
         self.detail = detail
         super().__init__(f"{status}: {detail}")
 
 
 class Classifier:
-    def __init__(self, api_key: str | None = None, model: str | None = None):
-        self.api_key = api_key or config.GEMINI_API_KEY
-        if not self.api_key:
-            raise RuntimeError(
-                "GEMINI_API_KEY is not set. Get a free key at "
-                "https://aistudio.google.com/apikey and set it in your environment."
-            )
+    def __init__(self, api_key=None, model=None):
+        self.api_key = api_key if api_key is not None else config.GEMINI_API_KEY
         self.model = model or config.GEMINI_MODEL
 
-    def _call_gemini(self, user_content: str) -> str:
+    def _call_gemini(self, user_content):
+        if not self.api_key:
+            raise GeminiError("no-key", "No API key configured.")
         url = ENDPOINT.format(model=self.model, key=self.api_key)
         body = {
             "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
@@ -86,7 +116,6 @@ class Classifier:
             },
         }
         data = json.dumps(body).encode("utf-8")
-
         last_err = None
         for attempt in range(MAX_RETRIES):
             req = urllib.request.Request(
@@ -99,27 +128,21 @@ class Classifier:
                 return payload["candidates"][0]["content"]["parts"][0]["text"]
             except urllib.error.HTTPError as e:
                 try:
-                    detail = e.read().decode("utf-8", errors="replace")
+                    detail = json.loads(e.read().decode("utf-8", "replace"))["error"]["message"]
                 except Exception:
-                    detail = ""
-                try:
-                    detail = json.loads(detail)["error"]["message"]
-                except Exception:
-                    detail = detail[:200]
+                    detail = "HTTP error"
                 last_err = GeminiError(e.code, detail)
                 if e.code in (429, 500, 503) and attempt < MAX_RETRIES - 1:
-                    time.sleep(3 * (attempt + 1))
+                    time.sleep(2 * (attempt + 1))
                     continue
                 raise last_err
             except urllib.error.URLError as e:
                 last_err = GeminiError("network", str(e.reason))
                 if attempt < MAX_RETRIES - 1:
-                    time.sleep(3 * (attempt + 1))
+                    time.sleep(2 * (attempt + 1))
                     continue
                 raise last_err
-        if last_err:
-            raise last_err
-        raise GeminiError("unknown", "no response")
+        raise last_err or GeminiError("unknown", "no response")
 
     def _classify_batch(self, batch):
         parts = []
@@ -134,19 +157,15 @@ class Classifier:
         try:
             raw = self._call_gemini(user_content)
             results = {int(r["id"]): r for r in self._parse_array(raw)}
-        except GeminiError as ge:
+        except Exception:
             for e in batch:
-                self._apply_error(e, f"AI error {ge.status}: {ge.detail}")
-            return
-        except Exception as exc:
-            for e in batch:
-                self._apply_error(e, f"Could not classify ({exc.__class__.__name__}).")
+                self._rules_classify(e)
             return
 
         for idx, e in enumerate(batch):
             r = results.get(idx)
             if not r:
-                self._apply_error(e, "No verdict returned for this email.")
+                self._rules_classify(e)
                 continue
             try:
                 e.urgency = int(r.get("urgency", 1))
@@ -156,7 +175,7 @@ class Classifier:
                 if e.category not in config.CATEGORIES:
                     e.category = self._derive_category(e.urgency, e.importance)
             except Exception:
-                self._apply_error(e, "Malformed verdict for this email.")
+                self._rules_classify(e)
 
     def classify(self, email):
         self._classify_batch([email])
@@ -170,12 +189,49 @@ class Classifier:
                 time.sleep(DELAY_BETWEEN_BATCHES)
         return emails
 
-    @staticmethod
-    def _apply_error(e, msg):
-        e.category = "neither"
-        e.urgency = e.urgency or 1
-        e.importance = e.importance or 1
-        e.reason = msg[:300]
+    def _rules_classify(self, e):
+        subject = (e.subject or "").lower()
+        body = (e.body or e.snippet or "").lower()
+        sender = f"{e.sender} {e.sender_email}".lower()
+        reasons = []
+
+        is_bulk = bool(_hits(sender, BULK_SENDER) + _hits(body, BULK_BODY))
+
+        urgency = 1
+        if _hits(subject, URGENT_STRONG):
+            urgency += 3
+            reasons.append("urgent wording in subject")
+        elif _hits(body, URGENT_STRONG):
+            urgency += 2
+            reasons.append("urgent wording")
+        if _hits(subject, URGENT_SOFT):
+            urgency += 1
+        if subject.startswith(("re:", "fwd:", "fw:")):
+            urgency += 1
+        if is_bulk:
+            urgency -= 1
+        urgency = max(1, min(5, urgency))
+
+        importance = 2
+        if _hits(subject, IMPORTANT_TERMS):
+            importance += 2
+            reasons.append("important topic")
+        elif _hits(body, IMPORTANT_TERMS):
+            importance += 1
+        if subject.startswith(("re:", "fwd:", "fw:")):
+            importance += 1
+        if not is_bulk and " " in (e.sender or "").strip():
+            importance += 1
+        if is_bulk:
+            importance -= 2
+            reasons.append("looks like a bulk/promotional message")
+        importance = max(1, min(5, importance))
+
+        e.urgency = urgency
+        e.importance = importance
+        e.category = self._derive_category(urgency, importance)
+        note = "; ".join(reasons) if reasons else "no strong signals"
+        e.reason = f"{note} (quick sort)"
 
     @staticmethod
     def _derive_category(urgency, importance):
