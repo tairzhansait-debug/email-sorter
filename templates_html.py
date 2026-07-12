@@ -103,11 +103,21 @@ DASHBOARD_HTML = r"""<!doctype html>
   .col.urgent h2{background:var(--u);color:#1a1a1a}
   .col.important h2{background:var(--i)}
   .col.neither h2{background:var(--n)}
-  .card{padding:.7rem 1rem;border-top:1px solid var(--line)}
+  .card{border-top:1px solid var(--line)}
+  details.card>summary{padding:.7rem 1rem;cursor:pointer;list-style:none;outline:none}
+  details.card>summary::-webkit-details-marker{display:none}
+  details.card>summary::after{content:"▸ click to read";float:right;color:var(--muted);
+        font-size:.7rem;margin-top:.15rem}
+  details.card[open]>summary{background:var(--panel2)}
+  details.card[open]>summary::after{content:"▾ hide"}
   .card .subj{font-weight:600;font-size:.92rem;margin-bottom:.15rem}
   .card .from{color:var(--muted);font-size:.8rem;margin-bottom:.3rem}
   .card .reason{color:var(--muted);font-size:.8rem;font-style:italic}
   .scores{font-size:.72rem;color:var(--muted);margin-top:.35rem}
+  .ebody{padding:.6rem 1rem;white-space:pre-wrap;word-break:break-word;
+        font-size:.82rem;line-height:1.45;color:#c9cfda;max-height:300px;overflow:auto;
+        border-top:1px dashed var(--line);background:#12151c}
+  .elink{display:inline-block;margin:.55rem 1rem .75rem;font-size:.8rem}
   .pill{display:inline-block;background:var(--panel2);border:1px solid var(--line);
         border-radius:6px;padding:.05rem .4rem;margin-right:.3rem}
   .empty{padding:1.25rem 1rem;color:var(--muted);font-size:.85rem}
@@ -185,15 +195,21 @@ DASHBOARD_HTML = r"""<!doctype html>
       <h2>{{ category_labels[cat] }} <span class="count">{{ buckets[cat]|length }}</span></h2>
       {% if buckets[cat] %}
         {% for e in buckets[cat] %}
-        <div class="card">
-          <div class="subj">{{ e.subject }}</div>
-          <div class="from">{{ e.sender }}</div>
-          {% if e.reason %}<div class="reason">{{ e.reason }}</div>{% endif %}
-          <div class="scores">
-            <span class="pill">Urgency {{ e.urgency }}/5</span>
-            <span class="pill">Importance {{ e.importance }}/5</span>
-          </div>
-        </div>
+        <details class="card">
+          <summary>
+            <div class="subj">{{ e.subject }}</div>
+            <div class="from">{{ e.sender }}</div>
+            {% if e.reason %}<div class="reason">{{ e.reason }}</div>{% endif %}
+            <div class="scores">
+              <span class="pill">Urgency {{ e.urgency }}/5</span>
+              <span class="pill">Importance {{ e.importance }}/5</span>
+            </div>
+          </summary>
+          <div class="ebody">{{ e.body or e.snippet or 'No preview available.' }}</div>
+          <a class="elink" target="_blank" rel="noopener"
+             href="https://mail.google.com/mail/?authuser={{ account }}#all/{{ e.id }}">
+             Open in Gmail ↗</a>
+        </details>
         {% endfor %}
       {% else %}
         <div class="empty">Nothing here.</div>
