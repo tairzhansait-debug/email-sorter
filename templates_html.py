@@ -55,7 +55,7 @@ LOGIN_HTML = r"""<!doctype html>
       Sign in with Microsoft
     </a>
     {% if not has_api_key %}
-      <div class="warn">⚠️ Server note: <code>GEMINI_API_KEY</code> is not set,
+      <div class="warn">⚠️ Server note: <code>GROQ_API_KEY</code> is not set,
         so AI sorting is disabled until the admin configures it.</div>
     {% endif %}
     <p class="fine">We request read + label access only — the app can never delete
@@ -170,7 +170,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   {% endwith %}
 
   {% if not has_api_key %}
-    <div class="banner">⚠️ No <code>GEMINI_API_KEY</code> found. Add it to your
+    <div class="banner">⚠️ No <code>GROQ_API_KEY</code> found. Add it to your
       host settings to enable AI sorting.</div>
   {% endif %}
 
@@ -184,6 +184,13 @@ DASHBOARD_HTML = r"""<!doctype html>
     <form class="inline" method="post" action="{{ url_for('sort_emails') }}">
       <button type="submit" {{ 'disabled' if not account or not has_api_key }}>
         ⚡ Sort {{ max_emails }} newest emails
+      </button>
+    </form>
+    <form class="inline" method="post" action="{{ url_for('sort_emails') }}"
+          title="Re-classify everything, ignoring previous results">
+      <input type="hidden" name="full" value="1">
+      <button class="secondary" type="submit" {{ 'disabled' if not account or not has_api_key }}>
+        ↻ Full re-sort
       </button>
     </form>
     <form class="inline" method="post" action="{{ url_for('apply_labels') }}">
