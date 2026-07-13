@@ -21,21 +21,14 @@ CLIENT_SECRET_FILE = Path(
 USERS_DIR.mkdir(parents=True, exist_ok=True)
 
 # --- Public URL & OAuth ----------------------------------------------------
-# The externally-reachable base URL of the deployed app, e.g.
-# https://email-sorter.onrender.com  (no trailing slash). Used to build the
-# OAuth redirect URI so it always matches what Google expects.
 BASE_URL = os.getenv("BASE_URL", "http://localhost:5000").rstrip("/")
 OAUTH_REDIRECT_PATH = "/oauth2callback"
 OAUTH_REDIRECT_URI = f"{BASE_URL}{OAUTH_REDIRECT_PATH}"
 
-# Google requires HTTPS for OAuth except on localhost. Allow plain http only
-# for local development.
 if BASE_URL.startswith("http://localhost") or BASE_URL.startswith("http://127."):
     os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
 
 # --- Gmail scopes ----------------------------------------------------------
-# gmail.modify can read mail and add/remove labels but CANNOT permanently
-# delete anything. openid + email let us identify the signed-in user.
 GMAIL_SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
     "openid",
@@ -43,6 +36,12 @@ GMAIL_SCOPES = [
 ]
 
 MAX_EMAILS = int(os.getenv("MAX_EMAILS", "40"))
+
+# --- Microsoft 365 / Outlook (optional second provider) ---------------------
+MS_CLIENT_ID = os.getenv("MS_CLIENT_ID", "")
+MS_CLIENT_SECRET = os.getenv("MS_CLIENT_SECRET", "")
+MS_REDIRECT_PATH = "/oauth2callback/ms"
+MS_REDIRECT_URI = f"{BASE_URL}{MS_REDIRECT_PATH}"
 
 # --- Classifier (Google Gemini free tier) ----------------------------------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
