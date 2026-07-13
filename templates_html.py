@@ -37,8 +37,8 @@ LOGIN_HTML = r"""<!doctype html>
 <body>
   <div class="card">
     <h1>📥 Email Sorter</h1>
-    <p>Sort your Gmail inbox by <strong>urgency</strong> and <strong>importance</strong>
-       with AI — then label it and export a report.</p>
+    <p>Sort your inbox by <strong>urgency</strong> and <strong>importance</strong>
+       — then label it and export a report. Works with Gmail and Outlook.</p>
     <div class="matrix">
       <div class="q q1">Urgent &amp; Important</div>
       <div class="q q3">Urgent, Not Important</div>
@@ -48,6 +48,11 @@ LOGIN_HTML = r"""<!doctype html>
     <a class="btn" href="{{ url_for('authorize') }}">
       <svg class="g" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.5 0 6.6 1.2 9.1 3.6l6.8-6.8C35.9 2.4 30.3 0 24 0 14.6 0 6.4 5.4 2.5 13.3l7.9 6.1C12.3 13.2 17.7 9.5 24 9.5z"/><path fill="#4285F4" d="M46.5 24.5c0-1.6-.1-3.1-.4-4.5H24v9h12.7c-.5 3-2.2 5.5-4.7 7.2l7.3 5.7C43.9 38 46.5 31.9 46.5 24.5z"/><path fill="#FBBC05" d="M10.4 28.6c-.5-1.5-.8-3-.8-4.6s.3-3.1.8-4.6l-7.9-6.1C.9 16.5 0 20.1 0 24s.9 7.5 2.5 10.7l7.9-6.1z"/><path fill="#34A853" d="M24 48c6.3 0 11.6-2.1 15.5-5.7l-7.3-5.7c-2 1.4-4.7 2.3-8.2 2.3-6.3 0-11.7-3.7-13.6-9.1l-7.9 6.1C6.4 42.6 14.6 48 24 48z"/></svg>
       Sign in with Google
+    </a>
+    <br>
+    <a class="btn" style="margin-top:.6rem" href="{{ url_for('authorize_ms') }}">
+      <svg class="g" viewBox="0 0 23 23"><rect x="1" y="1" width="10" height="10" fill="#F35325"/><rect x="12" y="1" width="10" height="10" fill="#81BC06"/><rect x="1" y="12" width="10" height="10" fill="#05A6F0"/><rect x="12" y="12" width="10" height="10" fill="#FFBA08"/></svg>
+      Sign in with Microsoft
     </a>
     {% if not has_api_key %}
       <div class="warn">⚠️ Server note: <code>GEMINI_API_KEY</code> is not set,
@@ -134,17 +139,20 @@ DASHBOARD_HTML = r"""<!doctype html>
   <form class="inline" method="post" action="{{ url_for('switch') }}">
     <select name="account" onchange="this.form.submit()" title="Inbox being sorted">
       {% for a in accounts %}
-        <option value="{{ a }}" {{ 'selected' if a == account }}>{{ a }}</option>
+        <option value="{{ a }}" {{ 'selected' if a == account }}>{% if a.startswith('ms:') %}{{ a[3:] }} (Outlook){% else %}{{ a }} (Gmail){% endif %}</option>
       {% endfor %}
     </select>
   </form>
   {% endif %}
   <a class="inline" href="{{ url_for('authorize') }}">
-    <button class="secondary" type="button">+ Connect another inbox</button>
+    <button class="secondary" type="button">+ Gmail inbox</button>
+  </a>
+  <a class="inline" href="{{ url_for('authorize_ms') }}">
+    <button class="secondary" type="button">+ Outlook inbox</button>
   </a>
   {% if account %}
   <form class="inline" method="post" action="{{ url_for('remove_account') }}"
-        onsubmit="return confirm('Disconnect {{ account }}? (removes local access only — nothing in Gmail is deleted)')">
+        onsubmit="return confirm('Disconnect this inbox? (removes local access only — nothing in your mailbox is deleted)')">
     <input type="hidden" name="account" value="{{ account }}">
     <button class="danger" type="submit">Disconnect</button>
   </form>
@@ -167,9 +175,9 @@ DASHBOARD_HTML = r"""<!doctype html>
   {% endif %}
 
   {% if not accounts %}
-    <div class="banner">👋 No Gmail account connected yet. Click
-      <strong>“+ Connect another inbox”</strong> to authorize one. You can add
-      several and switch between them anytime.</div>
+    <div class="banner">👋 No inbox connected yet. Click
+      <strong>“+ Gmail inbox”</strong> or <strong>“+ Outlook inbox”</strong> to
+      authorize one. You can add several and switch between them anytime.</div>
   {% endif %}
 
   <div class="toolbar">
@@ -180,7 +188,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     </form>
     <form class="inline" method="post" action="{{ url_for('apply_labels') }}">
       <button class="secondary" type="submit" {{ 'disabled' if not total }}>
-        🏷️ Apply labels in Gmail
+        🏷️ Apply labels
       </button>
     </form>
     <a href="{{ url_for('export', fmt='csv') }}"><button class="secondary" {{ 'disabled' if not total }}>⬇ CSV</button></a>
@@ -206,9 +214,14 @@ DASHBOARD_HTML = r"""<!doctype html>
             </div>
           </summary>
           <div class="ebody">{{ e.body or e.snippet or 'No preview available.' }}</div>
+          {% if account.startswith('ms:') %}
+          <a class="elink" target="_blank" rel="noopener" href="{{ e.thread_id }}">
+             Open in Outlook ↗</a>
+          {% else %}
           <a class="elink" target="_blank" rel="noopener"
              href="https://mail.google.com/mail/?authuser={{ account }}#all/{{ e.id }}">
              Open in Gmail ↗</a>
+          {% endif %}
         </details>
         {% endfor %}
       {% else %}
