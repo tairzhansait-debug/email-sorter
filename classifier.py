@@ -1,11 +1,11 @@
 """Email classification: AI-first with an automatic no-cost fallback.
 
-Primary: Google Gemini (free tier) classifies emails in BATCHES (many emails
-per request) to stay within rate limits.
+Primary: Groq's free AI tier (Llama models) classifies emails in BATCHES
+(many emails per request) to stay within rate limits.
 
-Fallback: if Gemini is unavailable for ANY reason (no key, quota/429, region
-block, network error), we transparently fall back to a rules-based scorer so
-the inbox still gets sorted. After the first failure in a run we stop calling
+Fallback: if the AI is unavailable for ANY reason (no key, rate limit,
+network error), we transparently fall back to a rules-based scorer so the
+inbox still gets sorted. After the first failure in a run we stop calling
 the AI for the rest of that run, so big sorts stay fast.
 """
 from __future__ import annotations
@@ -22,12 +22,10 @@ if TYPE_CHECKING:
     from gmail_client import Email
 
 
-ENDPOINT = (
-    "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
-)
+ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 
 BATCH_SIZE = 15
-DELAY_BETWEEN_BATCHES = 1
+DELAY_BETWEEN_BATCHES = 3
 MAX_RETRIES = 2
 BODY_CHARS = 700
 
@@ -98,34 +96,35 @@ class GeminiError(Exception):
 
 class Classifier:
     def __init__(self, api_key=None, model=None):
-        self.api_key = api_key if api_key is not None else config.GEMINI_API_KEY
-        self.model = model or config.GEMINI_MODEL
+        self.api_key = api_key if api_key is not None else config.GROQ_API_KEY
+        self.model = model or config.GROQ_MODEL
         self._ai_down = False  # set after the first AI failure in this run
 
     def _call_gemini(self, user_content):
         if not self.api_key:
             raise GeminiError("no-key", "No API key configured.")
-        url = ENDPOINT.format(model=self.model, key=self.api_key)
         body = {
-            "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-            "contents": [{"role": "user", "parts": [{"text": user_content}]}],
-            "generationConfig": {
-                "maxOutputTokens": 4096,
-                "temperature": 0,
-                "responseMimeType": "application/json",
-            },
+            "model": self.model,
+            "temperature": 0,
+            "max_tokens": 4096,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_content},
+            ],
         }
         data = json.dumps(body).encode("utf-8")
         last_err = None
         for attempt in range(MAX_RETRIES):
             req = urllib.request.Request(
-                url, data=data,
-                headers={"Content-Type": "application/json"}, method="POST",
+                ENDPOINT, data=data,
+                headers={"Content-Type": "application/json",
+                         "Authorization": f"Bearer {self.api_key}"},
+                method="POST",
             )
             try:
                 with urllib.request.urlopen(req, timeout=60) as resp:
                     payload = json.loads(resp.read().decode("utf-8"))
-                return payload["candidates"][0]["content"]["parts"][0]["text"]
+                return payload["choices"][0]["message"]["content"]
             except urllib.error.HTTPError as e:
                 try:
                     detail = json.loads(e.read().decode("utf-8", "replace"))["error"]["message"]
@@ -133,13 +132,13 @@ class Classifier:
                     detail = "HTTP error"
                 last_err = GeminiError(e.code, detail)
                 if e.code in (500, 503) and attempt < MAX_RETRIES - 1:
-                    time.sleep(2)
+                    time.sleep(2 * (attempt + 1))
                     continue
                 raise last_err
             except urllib.error.URLError as e:
                 last_err = GeminiError("network", str(e.reason))
                 if attempt < MAX_RETRIES - 1:
-                    time.sleep(2)
+                    time.sleep(2 * (attempt + 1))
                     continue
                 raise last_err
         raise last_err or GeminiError("unknown", "no response")
@@ -163,7 +162,7 @@ class Classifier:
             raw = self._call_gemini(user_content)
             results = {int(r["id"]): r for r in self._parse_array(raw)}
         except Exception:
-            self._ai_down = True  # don't keep knocking this run
+            self._ai_down = True  # AI unavailable → rules for the rest of this run
             for e in batch:
                 self._rules_classify(e)
             return
