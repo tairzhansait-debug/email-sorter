@@ -118,7 +118,9 @@ class Classifier:
             req = urllib.request.Request(
                 ENDPOINT, data=data,
                 headers={"Content-Type": "application/json",
-                         "Authorization": f"Bearer {self.api_key}"},
+                         "Authorization": f"Bearer {self.api_key}",
+                         "Accept": "application/json",
+                         "User-Agent": "email-sorter/1.0 (+https://email-sorter-zc4v.onrender.com)"},
                 method="POST",
             )
             try:
