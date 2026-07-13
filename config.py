@@ -1,8 +1,4 @@
-"""Central configuration for the Email Sorter (multi-user web app).
-
-Values are read from environment variables (loaded from a local .env file in
-development; set as real env vars on your host in production).
-"""
+"""Central configuration for the Email Sorter (multi-user web app)."""
 import os
 from pathlib import Path
 
@@ -13,10 +9,10 @@ load_dotenv()
 # --- Paths -----------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("DATA_DIR", BASE_DIR / "data"))
-USERS_DIR = DATA_DIR / "users"        # per-user folder: tokens + last sort
+USERS_DIR = DATA_DIR / "users"
 CLIENT_SECRET_FILE = Path(
     os.getenv("CLIENT_SECRET_FILE", BASE_DIR / "credentials.json")
-)  # "Web application" OAuth client from Google Cloud
+)
 
 USERS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -43,7 +39,12 @@ MS_CLIENT_SECRET = os.getenv("MS_CLIENT_SECRET", "")
 MS_REDIRECT_PATH = "/oauth2callback/ms"
 MS_REDIRECT_URI = f"{BASE_URL}{MS_REDIRECT_PATH}"
 
-# --- Classifier (Google Gemini free tier) ----------------------------------
+# --- Classifier (Groq free tier) --------------------------------------------
+# Get a free key (no card) at https://console.groq.com/keys
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+
+# Legacy (kept so older code versions can still boot during upgrades)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
