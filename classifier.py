@@ -24,10 +24,10 @@ if TYPE_CHECKING:
 
 ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 
-BATCH_SIZE = 15
+BATCH_SIZE = 10
 DELAY_BETWEEN_BATCHES = 3
 MAX_RETRIES = 2
-BODY_CHARS = 700
+BODY_CHARS = 350
 
 SYSTEM_PROMPT = """You are an expert executive assistant who triages email.
 
@@ -106,7 +106,7 @@ class Classifier:
         body = {
             "model": self.model,
             "temperature": 0,
-            "max_tokens": 4096,
+            "max_tokens": 800,
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_content},
@@ -133,6 +133,9 @@ class Classifier:
                 except Exception:
                     detail = "HTTP error"
                 last_err = GeminiError(e.code, detail)
+                if e.code in (413, 429) and attempt < MAX_RETRIES - 1:
+                    time.sleep(20)  # let the per-minute token allowance refill
+                    continue
                 if e.code in (500, 503) and attempt < MAX_RETRIES - 1:
                     time.sleep(2 * (attempt + 1))
                     continue
