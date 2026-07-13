@@ -5,9 +5,8 @@ per request) to stay within rate limits.
 
 Fallback: if Gemini is unavailable for ANY reason (no key, quota/429, region
 block, network error), we transparently fall back to a rules-based scorer so
-the inbox still gets sorted. Rules use urgency keywords, sender type, and
-conversation signals. When the free AI becomes available, the app uses it
-again automatically with no changes.
+the inbox still gets sorted. After the first failure in a run we stop calling
+the AI for the rest of that run, so big sorts stay fast.
 """
 from __future__ import annotations
 
@@ -28,7 +27,7 @@ ENDPOINT = (
 )
 
 BATCH_SIZE = 15
-DELAY_BETWEEN_BATCHES = 3
+DELAY_BETWEEN_BATCHES = 1
 MAX_RETRIES = 2
 BODY_CHARS = 700
 
@@ -101,6 +100,7 @@ class Classifier:
     def __init__(self, api_key=None, model=None):
         self.api_key = api_key if api_key is not None else config.GEMINI_API_KEY
         self.model = model or config.GEMINI_MODEL
+        self._ai_down = False  # set after the first AI failure in this run
 
     def _call_gemini(self, user_content):
         if not self.api_key:
@@ -132,19 +132,24 @@ class Classifier:
                 except Exception:
                     detail = "HTTP error"
                 last_err = GeminiError(e.code, detail)
-                if e.code in (429, 500, 503) and attempt < MAX_RETRIES - 1:
-                    time.sleep(2 * (attempt + 1))
+                if e.code in (500, 503) and attempt < MAX_RETRIES - 1:
+                    time.sleep(2)
                     continue
                 raise last_err
             except urllib.error.URLError as e:
                 last_err = GeminiError("network", str(e.reason))
                 if attempt < MAX_RETRIES - 1:
-                    time.sleep(2 * (attempt + 1))
+                    time.sleep(2)
                     continue
                 raise last_err
         raise last_err or GeminiError("unknown", "no response")
 
     def _classify_batch(self, batch):
+        if self._ai_down:
+            for e in batch:
+                self._rules_classify(e)
+            return
+
         parts = []
         for idx, e in enumerate(batch):
             body = (e.body or e.snippet or "")[:BODY_CHARS]
@@ -158,6 +163,7 @@ class Classifier:
             raw = self._call_gemini(user_content)
             results = {int(r["id"]): r for r in self._parse_array(raw)}
         except Exception:
+            self._ai_down = True  # don't keep knocking this run
             for e in batch:
                 self._rules_classify(e)
             return
@@ -185,7 +191,7 @@ class Classifier:
         for start in range(0, len(emails), BATCH_SIZE):
             batch = emails[start : start + BATCH_SIZE]
             self._classify_batch(batch)
-            if start + BATCH_SIZE < len(emails):
+            if not self._ai_down and start + BATCH_SIZE < len(emails):
                 time.sleep(DELAY_BETWEEN_BATCHES)
         return emails
 
