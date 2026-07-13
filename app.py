@@ -63,7 +63,7 @@ def _selected_account(user_id):
 @app.route("/")
 def index():
     if not current_user():
-        return render_template_string(LOGIN_HTML, has_api_key=bool(config.GEMINI_API_KEY))
+        return render_template_string(LOGIN_HTML, has_api_key=bool(config.GROQ_API_KEY))
     return redirect(url_for("dashboard"))
 
 
@@ -71,7 +71,7 @@ def index():
 def login():
     if current_user():
         return redirect(url_for("dashboard"))
-    return render_template_string(LOGIN_HTML, has_api_key=bool(config.GEMINI_API_KEY))
+    return render_template_string(LOGIN_HTML, has_api_key=bool(config.GROQ_API_KEY))
 
 
 @app.route("/logout")
@@ -179,7 +179,7 @@ def dashboard():
         category_order=config.CATEGORY_ORDER,
         category_labels=config.CATEGORY_LABELS,
         total=len(emails),
-        has_api_key=bool(config.GEMINI_API_KEY),
+        has_api_key=bool(config.GROQ_API_KEY),
         max_emails=config.MAX_EMAILS,
     )
 
@@ -214,13 +214,15 @@ def sort_emails():
     if not account:
         flash("Connect an inbox first.", "error")
         return redirect(url_for("dashboard"))
+    full = request.form.get("full") == "1"
     try:
         classifier = Classifier()
         client = make_client(user_id, account)
         emails = client.fetch_inbox()
-        classifier.classify_all(emails)
+        new = emails if full else _reuse_previous(user_id, account, emails)
+        classifier.classify_all(new)
         gmail_client.save_last_sort(user_id, account, emails)
-        flash(f"Sorted {len(emails)} emails.", "success")
+        flash(f"Sorted {len(emails)} emails ({len(new)} newly classified).", "success")
     except Exception as exc:
         flash(f"Sorting failed: {exc}", "error")
     return redirect(url_for("dashboard"))
@@ -263,6 +265,22 @@ def healthz():
     return {"status": "ok"}
 
 
+def _reuse_previous(user_id, account, emails):
+    """Keep classifications for emails we already sorted; return only new ones."""
+    prev = {d.get("id"): d for d in gmail_client.load_last_sort(user_id, account)}
+    new = []
+    for e in emails:
+        p = prev.get(e.id)
+        if p and p.get("category"):
+            e.category = p.get("category")
+            e.urgency = p.get("urgency")
+            e.importance = p.get("importance")
+            e.reason = p.get("reason", "")
+        else:
+            new.append(e)
+    return new
+
+
 def _run_all_sorts():
     clf = Classifier()
     summary = {"users": 0, "accounts": 0, "emails": 0, "labeled": 0, "errors": []}
@@ -272,9 +290,10 @@ def _run_all_sorts():
             try:
                 client = make_client(user_id, account)
                 emails = client.fetch_inbox()
-                clf.classify_all(emails)
+                new = _reuse_previous(user_id, account, emails)
+                clf.classify_all(new)
                 gmail_client.save_last_sort(user_id, account, emails)
-                n = client.apply_labels_bulk(emails)
+                n = client.apply_labels_bulk(new)
                 summary["accounts"] += 1
                 summary["emails"] += len(emails)
                 summary["labeled"] += n
