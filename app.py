@@ -1,4 +1,4 @@
-"""Email Sorter — multi-user web app."""
+"""Email Sorter — multi-user web app (Gmail + Outlook)."""
 from __future__ import annotations
 
 import functools
@@ -12,10 +12,19 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 
 import config
 import gmail_client
+import ms_client
 import report
 from classifier import Classifier
 from gmail_client import Email
 from templates_html import DASHBOARD_HTML, LOGIN_HTML
+
+
+def make_client(user_id, account):
+    """Pick the right mailbox client for an account (Gmail or Microsoft)."""
+    if ms_client.is_ms_account(account):
+        return ms_client.MSClient(user_id, account)
+    return gmail_client.GmailClient(user_id, account)
+
 
 app = Flask(__name__)
 app.secret_key = config.FLASK_SECRET_KEY
@@ -109,6 +118,46 @@ def oauth2callback():
     return redirect(url_for("dashboard"))
 
 
+@app.route("/authorize/ms")
+def authorize_ms():
+    """Start Microsoft sign-in (work/school or personal Microsoft account)."""
+    session["ms_mode"] = "add" if current_user() else "login"
+    try:
+        import secrets as _s
+        state = _s.token_urlsafe(16)
+        url = ms_client.build_auth_url(state)
+    except Exception as exc:
+        flash(f"Microsoft sign-in is not configured: {exc}", "error")
+        return redirect(url_for("login") if not current_user() else url_for("dashboard"))
+    session["ms_oauth_state"] = state
+    return redirect(url)
+
+
+@app.route(config.MS_REDIRECT_PATH)
+def oauth2callback_ms():
+    if request.args.get("error"):
+        desc = request.args.get("error_description", request.args["error"])[:200]
+        flash(f"Microsoft sign-in was cancelled or blocked: {desc}", "error")
+        return redirect(url_for("login") if not current_user() else url_for("dashboard"))
+    state = session.pop("ms_oauth_state", None)
+    mode = session.pop("ms_mode", "login")
+    if not state or request.args.get("state") != state:
+        abort(400, "Missing or mismatched OAuth state.")
+    try:
+        account, tok = ms_client.exchange_code(request.args.get("code", ""))
+    except Exception as exc:
+        flash(f"Could not complete Microsoft sign-in: {exc}", "error")
+        return redirect(url_for("login") if not current_user() else url_for("dashboard"))
+
+    if mode == "login" or not current_user():
+        session["user_id"] = ms_client.display_name(account)
+    user_id = session["user_id"]
+    ms_client._save_ms_token(user_id, account, tok)
+    session["account"] = account
+    flash(f"Connected {ms_client.display_name(account)} (Outlook).", "success")
+    return redirect(url_for("dashboard"))
+
+
 @app.route("/dashboard")
 @login_required
 def dashboard():
@@ -163,15 +212,15 @@ def sort_emails():
     user_id = current_user()
     account = _selected_account(user_id)
     if not account:
-        flash("Connect a Gmail inbox first.", "error")
+        flash("Connect an inbox first.", "error")
         return redirect(url_for("dashboard"))
     try:
         classifier = Classifier()
-        client = gmail_client.GmailClient(user_id, account)
+        client = make_client(user_id, account)
         emails = client.fetch_inbox()
         classifier.classify_all(emails)
         gmail_client.save_last_sort(user_id, account, emails)
-        flash(f"Sorted {len(emails)} emails from {account}.", "success")
+        flash(f"Sorted {len(emails)} emails.", "success")
     except Exception as exc:
         flash(f"Sorting failed: {exc}", "error")
     return redirect(url_for("dashboard"))
@@ -187,9 +236,9 @@ def apply_labels():
         flash("Nothing to label — run a sort first.", "error")
         return redirect(url_for("dashboard"))
     try:
-        client = gmail_client.GmailClient(user_id, account)
+        client = make_client(user_id, account)
         n = client.apply_labels_bulk([Email.from_dict(d) for d in cached])
-        flash(f"Applied labels to {n} emails in Gmail.", "success")
+        flash(f"Applied labels/categories to {n} emails.", "success")
     except Exception as exc:
         flash(f"Applying labels failed: {exc}", "error")
     return redirect(url_for("dashboard"))
@@ -221,7 +270,7 @@ def _run_all_sorts():
         summary["users"] += 1
         for account in gmail_client.list_accounts(user_id):
             try:
-                client = gmail_client.GmailClient(user_id, account)
+                client = make_client(user_id, account)
                 emails = client.fetch_inbox()
                 clf.classify_all(emails)
                 gmail_client.save_last_sort(user_id, account, emails)
