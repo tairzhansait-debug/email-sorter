@@ -5,8 +5,8 @@ Primary: Groq's free AI tier (Llama models) classifies emails in BATCHES
 
 Fallback: if the AI is unavailable for ANY reason (no key, rate limit,
 network error), we transparently fall back to a rules-based scorer so the
-inbox still gets sorted. After the first failure in a run we stop calling
-the AI for the rest of that run, so big sorts stay fast.
+inbox still gets sorted. The first email card shows the AI error so problems
+are visible instead of silent.
 """
 from __future__ import annotations
 
@@ -161,10 +161,13 @@ class Classifier:
         try:
             raw = self._call_gemini(user_content)
             results = {int(r["id"]): r for r in self._parse_array(raw)}
-        except Exception:
+        except Exception as exc:
             self._ai_down = True  # AI unavailable → rules for the rest of this run
-            for e in batch:
+            detail = str(exc)[:220]
+            for i, e in enumerate(batch):
                 self._rules_classify(e)
+                if i == 0:
+                    e.reason = f"[AI error: {detail}] {e.reason}"
             return
 
         for idx, e in enumerate(batch):
